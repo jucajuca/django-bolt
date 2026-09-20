@@ -20,9 +20,11 @@ except ImportError:
 
 # Import local modules
 import msgspec
+from asgiref.sync import ThreadSensitiveContext, sync_to_async
 from django.conf import settings as django_settings
 from django.core.asgi import get_asgi_application
 from django.core.signals import request_finished, request_started
+from django.db import close_old_connections
 from django.db.models import QuerySet
 from django.utils.functional import SimpleLazyObject
 
@@ -2737,67 +2739,85 @@ class BoltAPI:
         # Note: _handler_api_map is always initialized in __init__ (no hasattr needed)
         original_api = self._handler_api_map.get(handler_id) if handler_id is not None else None
 
-        try:
-            # 1. Direct metadata access using handler_id (int key is faster than callable key)
-            # Integer hashing is O(1) with minimal overhead vs callable hashing
-            meta = self._handler_meta[handler_id]
+        # Pin all thread_sensitive sync work (Django middleware set_tenant, Django
+        # async ORM adapters) for this request to ONE thread. Without this, asgiref
+        # routes those calls to its process-wide single thread while the ORM pool
+        # runs on a different thread whose thread-local DatabaseWrapper was never
+        # set_tenant'd — leaking the public schema across tenants (django-tenants).
+        #
+        # Caveat: the bounded ORM pool (concurrency.run_in_orm_executor) stays
+        # parallel (thread_sensitive=False). Tenant propagation across that pool
+        # is a django-tenants concern (contextvar-based TenantMainRouter), not
+        # bolt's; this context only pins thread_sensitive middleware + handler
+        # work to one thread.
+        async with ThreadSensitiveContext():
+            try:
+                # 1. Direct metadata access using handler_id (int key is faster than callable key)
+                # Integer hashing is O(1) with minimal overhead vs callable hashing
+                meta = self._handler_meta[handler_id]
 
-            # 2. Lazy user loading using SimpleLazyObject (Django pattern)
-            # User is only loaded from DB when request.user is actually accessed
-            # Skip setting user=None — PyRequest.user getter already returns None.
-            auth_context = request.get("auth")
-            if auth_context:
-                revocation_handlers = meta["_revocation_handlers"]
-                if revocation_handlers is not None:
-                    await self._check_revocation(auth_context, revocation_handlers)
+                # 2. Lazy user loading using SimpleLazyObject (Django pattern)
+                # User is only loaded from DB when request.user is actually accessed
+                # Skip setting user=None — PyRequest.user getter already returns None.
+                auth_context = request.get("auth")
+                if auth_context:
+                    revocation_handlers = meta["_revocation_handlers"]
+                    if revocation_handlers is not None:
+                        await self._check_revocation(auth_context, revocation_handlers)
 
-                user_id = auth_context.get("user_id")
-                if user_id:
-                    # Route-local loader for the scheme that authenticated;
-                    # schemes with no backend instance (Rust session auth)
-                    # fall back to the default pk query. A loader of None
-                    # means the backend has no user resolution — leave
-                    # request.user unset (PyRequest getter returns None).
-                    loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
-                    if loader is not None:
-                        request["user"] = SimpleLazyObject(
-                            partial(loader, user_id, auth_context, meta["_user_load_is_async_ctx"])
-                        )
+                    user_id = auth_context.get("user_id")
+                    if user_id:
+                        # Route-local loader for the scheme that authenticated;
+                        # schemes with no backend instance (Rust session auth)
+                        # fall back to the default pk query. A loader of None
+                        # means the backend has no user resolution — leave
+                        # request.user unset (PyRequest getter returns None).
+                        loader = meta["_user_loaders"].get(auth_context.get("auth_backend"), default_django_user_loader)
+                        if loader is not None:
+                            request["user"] = SimpleLazyObject(
+                                partial(loader, user_id, auth_context, meta["_user_load_is_async_ctx"])
+                            )
 
-            # 3. Check if we need to execute middleware
-            # Middleware runs for:
-            # - Global Python middleware on the owning app
-            # - Router/route Python middleware on this handler
-            middleware_owner = original_api if original_api is not None else self
-            has_python_global_middleware = middleware_owner._has_python_global_middleware
-            has_route_python_middleware = meta["_has_route_python_middleware"]
-            api_with_middleware = (
-                middleware_owner if (has_python_global_middleware or has_route_python_middleware) else None
-            )
+                # 3. Check if we need to execute middleware
+                # Middleware runs for:
+                # - Global Python middleware on the owning app
+                # - Router/route Python middleware on this handler
+                middleware_owner = original_api if original_api is not None else self
+                has_python_global_middleware = middleware_owner._has_python_global_middleware
+                has_route_python_middleware = meta["_has_route_python_middleware"]
+                api_with_middleware = (
+                    middleware_owner if (has_python_global_middleware or has_route_python_middleware) else None
+                )
 
-            if api_with_middleware:
-                # Execute through middleware chain (Django-style)
-                return await self._dispatch_with_middleware(handler, request, handler_id, api_with_middleware, meta)
-            else:
-                # Fast path: no middleware, execute pre-compiled handler executor directly.
-                return await meta["_handler_executor"](handler, request)
+                if api_with_middleware:
+                    # Execute through middleware chain (Django-style)
+                    return await self._dispatch_with_middleware(handler, request, handler_id, api_with_middleware, meta)
+                else:
+                    # Fast path: no middleware, execute pre-compiled handler executor directly.
+                    return await meta["_handler_executor"](handler, request)
 
-        except HTTPException as he:
-            return self._handle_http_exception(he)
-        except Exception as e:
-            # BlackSheep pattern: only log unhandled exceptions (rare path)
-            if self._logging_middleware:
-                self._logging_middleware.log_exception(request, e, exc_info=True)
-            return self._handle_generic_exception(e, request=request)
-        finally:
-            # Auto-cleanup UploadFiles to prevent resource leaks
-            # Only runs for handlers with file uploads (optimization: skip for 95%+ of requests)
-            if meta["has_file_uploads"]:
-                request_state = request.setdefault("state", {})
-                upload_files = request_state.get("_upload_files", [])
-                for upload in upload_files:
-                    with suppress(Exception):
-                        upload.close_sync()
+            except HTTPException as he:
+                return self._handle_http_exception(he)
+            except Exception as e:
+                # BlackSheep pattern: only log unhandled exceptions (rare path)
+                if self._logging_middleware:
+                    self._logging_middleware.log_exception(request, e, exc_info=True)
+                return self._handle_generic_exception(e, request=request)
+            finally:
+                # Auto-cleanup UploadFiles to prevent resource leaks
+                # Only runs for handlers with file uploads (optimization: skip for 95%+ of requests)
+                if meta["has_file_uploads"]:
+                    request_state = request.setdefault("state", {})
+                    upload_files = request_state.get("_upload_files", [])
+                    for upload in upload_files:
+                        with suppress(Exception):
+                            upload.close_sync()
+
+            # Close stale connections on this request's thread-sensitive thread.
+            # Each request's set_tenant() state must not bleed into the next one,
+            # so close the thread's DB connection before the context ends. Runs
+            # thread_sensitive so it lands on the same thread that ran middleware.
+            await sync_to_async(close_old_connections, thread_sensitive=True)()
 
     def _dispatch_sync(self, handler: Callable, request: dict[str, Any], handler_id: int = None) -> Response:
         """
