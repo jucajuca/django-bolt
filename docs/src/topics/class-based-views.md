@@ -478,3 +478,140 @@ Sync handlers are automatically wrapped to run in a thread pool.
 !!! warning
 
     CRUD methods on ViewSets (`list`, `retrieve`, `create`, `update`, `partial_update`, `destroy`) currently do not support synchronous handlers.
+
+## Template class-based views
+
+Django-Bolt provides Django-style template views. These views render Django
+templates. They share the data and mutation logic with the API viewsets.
+
+The write views validate submitted form data against a `Serializer`. They accept
+URL-encoded forms and JSON bodies.
+
+### TemplateView
+
+Use `TemplateView` to render a template with a context:
+
+```python
+from django_bolt.views import TemplateView
+
+@api.view("/about")
+class AboutView(TemplateView):
+    template_name = "about.html"
+
+    async def get(self, request):
+        context = self.get_context_data(title="About Us")
+        return self.render_to_response(context)
+```
+
+### ListView
+
+Use `ListView` to render a list of objects:
+
+```python
+from django_bolt.views import ListView
+
+@api.view("/articles")
+class ArticleListView(ListView):
+    queryset = Article.objects.all()
+    template_name = "article_list.html"
+    context_object_name = "articles"
+```
+
+The objects are available as `object_list` and under the model name in lowercase.
+
+### DetailView
+
+Use `DetailView` to render one object. The view reads the lookup value from the
+path parameters. A missing object returns a 404 response.
+
+```python
+from django_bolt.views import DetailView
+
+@api.view("/articles/{pk}")
+class ArticleDetailView(DetailView):
+    queryset = Article.objects.all()
+    template_name = "article_detail.html"
+```
+
+### FormView
+
+Use `FormView` to render a form and process its submission:
+
+```python
+from django_bolt.views import FormView
+
+@api.view("/contact", methods=["GET", "POST"])
+class ContactView(FormView):
+    template_name = "contact.html"
+    form_serializer_class = ContactSerializer
+    success_url = "/contact/thanks"
+```
+
+On success, the view redirects to `success_url`. On a validation error, the view
+renders the template again with `form_errors` and `form_data` in the context. The
+response status code is 422.
+
+HTML form values arrive as strings. The view coerces each value to the serializer
+field type. Boolean fields accept `true`, `1`, `yes`, and `on` (and the matching
+false values). Integer and float fields accept numeric strings.
+
+### CreateView
+
+Use `CreateView` to render a form and create an object:
+
+```python
+from django_bolt.views import CreateView
+
+@api.view("/articles/new", methods=["GET", "POST"])
+class ArticleCreateView(CreateView):
+    queryset = Article.objects.all()
+    template_name = "article_form.html"
+    form_serializer_class = ArticleCreateSchema
+    success_url = "/articles"
+```
+
+On success, the view saves the object and redirects to `success_url`.
+
+### UpdateView
+
+Use `UpdateView` to render a form and update an object:
+
+```python
+from django_bolt.views import UpdateView
+
+@api.view("/articles/{pk}/edit", methods=["GET", "POST"])
+class ArticleUpdateView(UpdateView):
+    queryset = Article.objects.all()
+    template_name = "article_form.html"
+    form_serializer_class = ArticleUpdateSchema
+    success_url = "/articles"
+```
+
+On success, the view saves the object and redirects to `success_url`.
+
+### DeleteView
+
+Use `DeleteView` to render a confirmation page and delete an object:
+
+```python
+from django_bolt.views import DeleteView
+
+@api.view("/articles/{pk}/delete", methods=["GET", "POST"])
+class ArticleDeleteView(DeleteView):
+    queryset = Article.objects.all()
+    template_name = "article_confirm_delete.html"
+    success_url = "/articles"
+```
+
+On POST, the view deletes the object and redirects to `success_url`.
+
+### Shared behavior
+
+The template views inherit the read and mutation logic from the API viewsets.
+Set `queryset` and the serializer classes in the same way. Override
+`get_queryset()` and `get_object()` to change the data selection.
+
+The `TestClient` follows redirects by default. To check a redirect, read the
+`response.history` list. The first entry holds the 302 response and its
+`location` header.
+

@@ -74,6 +74,12 @@ def pytest_configure(config):
                                 "django.template.loaders.locmem.Loader",
                                 {
                                     "test_dashboard.html": "<html><body><h1>{{ title }}</h1></body></html>",
+                                    "test_article_list.html": "<ul>{% for article in articles %}<li>{{ article.title }}</li>{% endfor %}</ul>",
+                                    "test_article_detail.html": "<h1>{{ article.title }}</h1><p>{{ article.content }}</p>",
+                                    "test_article_form.html": "<form>{% for error in form_errors %}<p class=\"error\">{{ error }}</p>{% endfor %}<input name=\"title\" value=\"{{ form_data.title }}\"></form>",
+                                    "test_article_confirm_delete.html": "<h1>Delete {{ object.title }}</h1>",
+                                    "test_contact_form.html": "<form>{% for error in form_errors %}<p class=\"error\">{{ error }}</p>{% endfor %}</form>",
+                                    "test_thanks.html": "<h1>Thanks</h1>",
                                     "test_static_page.html": """{% load static %}
 <!DOCTYPE html>
 <html>

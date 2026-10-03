@@ -18,16 +18,20 @@ Example:
 import inspect
 from collections.abc import Callable
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_type_hints
+from urllib.parse import parse_qs
 
 from django.db.models import Model, ObjectDoesNotExist, QuerySet
 
 from ._json import decode
 from ._view_context import _current_action, _current_request
-from .exceptions import HTTPException
+from .enums import MediaType
+from .exceptions import HTTPException, RequestValidationError
 from .pagination import PaginationBase
 from .request import Request
+from .responses import Redirect
 from .serializers.base import Serializer
+from .shortcuts import render as _render
 
 
 def _layer(value: bool | None, outer: bool | None) -> bool | None:
@@ -225,31 +229,62 @@ class APIView:
         return allowed
 
 
-class ViewSet[T: Model](APIView):
+class ContextMixin:
     """
-    ViewSet for CRUD operations on resources.
+    Mixin that provides template context helpers.
 
-    Provides a higher-level abstraction for common REST patterns.
-    Subclasses can implement standard methods: list, retrieve, create, update, partial_update, destroy.
-
-    Example:
-        @api.viewset("/users")
-        class UserViewSet(ViewSet):
-            queryset = User.objects.all()
-            serializer_class = UserSchema
-            list_serializer_class = UserMiniSchema  # Optional: different serializer for lists
-            pagination_class = PageNumberPagination  # Optional: enable pagination
-
-            async def list(self, request):
-                return await self.get_queryset()
-
-            async def retrieve(self, request):
-                return await self.get_object()
+    Web views use this mixin to build the context dict passed to templates.
     """
 
-    # ViewSet configuration
-    queryset: QuerySet[T] = None
-    serializer_class: type[Serializer] = None
+    extra_context: dict[str, Any] | None = None
+
+    def get_context_data(self, **kwargs: Any) -> dict[str, Any]:
+        """
+        Return the context dict for this view.
+
+        Start with ``extra_context``, then layer on the given keyword arguments.
+
+        Args:
+            **kwargs: Extra context values
+
+        Returns:
+            The combined context dict
+        """
+        context: dict[str, Any] = {}
+        if self.extra_context is not None:
+            context.update(self.extra_context)
+        context.update(kwargs)
+        return context
+
+    def get_context_object_name(self, obj: Model) -> str | None:
+        """
+        Return the context variable name for the given object.
+
+        Uses the model's lowercased name (e.g. ``article`` for ``Article``)
+        unless the model overrides its ``Meta.verbose_name``.
+
+        Args:
+            obj: The model instance or queryset
+
+        Returns:
+            The context variable name, or None when no model is available
+        """
+        model = getattr(obj, "model", None) if isinstance(obj, QuerySet) else type(obj)
+        if model is None:
+            return None
+        return model._meta.model_name
+
+
+class ObjectLookupMixin[T: Model]:
+    """
+    Mixin that provides queryset and object lookup logic.
+
+    This mixin holds the shared data-layer logic used by both ``ViewSet`` and
+    the template class-based views (list, detail, create, update, delete).
+    """
+
+    queryset: QuerySet[T] | None = None
+    serializer_class: type[Serializer] | None = None
 
     # Optional: separate serializer for list/create/update operations
     list_serializer_class: type[Serializer] | None = None
@@ -258,10 +293,6 @@ class ViewSet[T: Model](APIView):
 
     lookup_field: str = "pk"  # Field to use for object lookup (default: 'pk')
     pagination_class: type[PaginationBase] | None = None  # Optional: pagination class to use
-
-    @property
-    def action(self) -> str:
-        return _current_action.get()
 
     def __init_subclass__(cls, **kwargs):
         """
@@ -500,6 +531,15 @@ class ViewSet[T: Model](APIView):
                 action = _current_action.get()
         return self.__class__._get_default_serializer_class(action)
 
+
+class MutationMixin[T: Model]:
+    """
+    Mixin that provides the persistence hooks for write operations.
+
+    This mixin holds the shared mutation logic used by both ``ViewSet`` and the
+    template create/update/delete views.
+    """
+
     async def perform_create(self, obj: T):
         await obj.asave()
 
@@ -517,13 +557,40 @@ class ViewSet[T: Model](APIView):
         # If a subclass only overrides the misspelled hook, keep honoring it so
         # existing branch consumers don't silently lose their custom behavior.
         if (
-            type(self).perform_destory is not ViewSet.perform_destory
-            and type(self).perform_destroy is ViewSet.perform_destroy
+            type(self).perform_destory is not MutationMixin.perform_destory
+            and type(self).perform_destroy is MutationMixin.perform_destroy
         ):
             await self.perform_destory(obj)
             return
 
         await self.perform_destroy(obj)
+
+
+class ViewSet[T: Model](ObjectLookupMixin[T], MutationMixin[T], APIView):
+    """
+    ViewSet for CRUD operations on resources.
+
+    Provides a higher-level abstraction for common REST patterns.
+    Subclasses can implement standard methods: list, retrieve, create, update, partial_update, destroy.
+
+    Example:
+        @api.viewset("/users")
+        class UserViewSet(ViewSet):
+            queryset = User.objects.all()
+            serializer_class = UserSchema
+            list_serializer_class = UserMiniSchema  # Optional: different serializer for lists
+            pagination_class = PageNumberPagination  # Optional: enable pagination
+
+            async def list(self, request):
+                return await self.get_queryset()
+
+            async def retrieve(self, request):
+                return await self.get_object()
+    """
+
+    @property
+    def action(self) -> str:
+        return _current_action.get()
 
 
 # Mixins for common CRUD operations
@@ -757,3 +824,438 @@ class ModelViewSet(
     """
 
     pass
+
+
+# ============================================================================
+# Template class-based views
+#
+# These views render Django templates and share the data, mutation, and
+# validation logic with the API ViewSets. The write views validate submitted
+# form data against the same Serializer schemas used by the API paths.
+# ============================================================================
+
+
+class TemplateResponseMixin:
+    """
+    Provide a template rendering interface for web views.
+
+    Subclasses set ``template_name`` and call ``render_to_response(context)``.
+    """
+
+    template_name: str | None = None
+    content_type: str | MediaType = MediaType.HTML
+
+    def get_template_names(self) -> list[str]:
+        """
+        Return the list of template names to use for this view.
+
+        Returns:
+            A list with a single template name
+
+        Raises:
+            HTTPException: When no ``template_name`` is set
+        """
+        if self.template_name is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"TemplateResponseMixin requires a 'template_name' attribute on {self.__class__.__name__}",
+            )
+        return [self.template_name]
+
+    def render_to_response(self, context: dict[str, Any] | None = None, **response_kwargs: Any):
+        """
+        Render a template with the given context and return an HTML response.
+
+        Args:
+            context: The template context dict
+            **response_kwargs: Extra keyword arguments (``content_type``, ``status``)
+
+        Returns:
+            An HTML response
+        """
+        context = context or {}
+        template_name = self.get_template_names()[0]
+        content_type = response_kwargs.pop("content_type", self.content_type)
+        status = response_kwargs.pop("status", 200)
+        return _render(self.request, template_name, context, content_type=content_type, status=status)
+
+
+class RedirectMixin:
+    """
+    Provide redirect support for write views.
+    """
+
+    success_url: str | None = None
+
+    def get_success_url(self) -> str:
+        """
+        Return the URL to redirect to after a successful write.
+
+        Override to build a URL from the saved object (for example, call
+        ``django.urls.reverse`` with the object's primary key).
+
+        Returns:
+            The redirect URL
+
+        Raises:
+            HTTPException: When no ``success_url`` is set
+        """
+        if self.success_url is not None:
+            return self.success_url
+        raise HTTPException(
+            status_code=500,
+            detail=f"'{self.__class__.__name__}' should either include a `success_url` attribute, "
+            f"or override the `get_success_url()` method.",
+        )
+
+    def redirect(self, url: str, *, status_code: int = 302) -> Redirect:
+        """
+        Return a redirect response to the given URL.
+
+        Args:
+            url: The target URL
+            status_code: The HTTP status code (default 302)
+
+        Returns:
+            A Redirect response
+        """
+        return Redirect(url, status_code=status_code)
+
+
+class FormMixin(RedirectMixin):
+    """
+    Provide form handling behavior for write views.
+
+    The write path validates submitted form data against the shared
+    ``Serializer`` schema (the same schema used by the API write paths).
+    """
+
+    form_serializer_class: type[Serializer] | None = None
+
+    def get_form_serializer_class(self) -> type[Serializer]:
+        """
+        Return the serializer class used to validate form submissions.
+
+        Defaults to the create serializer class. Override to change this.
+
+        Returns:
+            The serializer class
+        """
+        if self.form_serializer_class is not None:
+            return self.form_serializer_class
+        return self.get_serializer_class("create")
+
+    def get_form_data(self) -> dict[str, Any]:
+        """
+        Extract submitted form data from the request body.
+
+        Supports both URL-encoded forms and JSON bodies. Repeated keys are
+        collected into lists; single values are flattened.
+
+        Returns:
+            A dict of submitted form fields
+        """
+        content_type = self.request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            data = decode(self.request.body)
+            return dict(data) if isinstance(data, dict) else {}
+        raw = self.request.body.decode("utf-8", errors="replace")
+        parsed = parse_qs(raw, keep_blank_values=True)
+        return {key: value[0] if len(value) == 1 else value for key, value in parsed.items()}
+
+    def validate_form(self) -> Any:
+        """
+        Validate the submitted form data and return a serializer instance.
+
+        HTML form values arrive as strings, so each value is coerced to the
+        serializer field's declared type before validation.
+
+        Returns:
+            The validated serializer instance
+
+        Raises:
+            RequestValidationError: When validation fails
+        """
+        serializer_class = self.get_form_serializer_class()
+        data = self.get_form_data()
+        hints = get_type_hints(serializer_class)
+        coerced = {key: self._coerce_value(value, hints.get(key)) for key, value in data.items()}
+        return serializer_class.model_validate(coerced)
+
+    def _coerce_value(self, value: Any, field_type: Any) -> Any:
+        """
+        Coerce a raw form value to the serializer field's declared type.
+
+        Mirrors the Rust parameter coercion semantics so that form data maps
+        onto typed serializer fields.
+
+        Args:
+            value: The raw form value (usually a string)
+            field_type: The declared serializer field type
+
+        Returns:
+            The coerced value
+        """
+        if isinstance(value, list):
+            return [self._coerce_value(item, field_type) for item in value]
+        if not isinstance(value, str):
+            return value
+        if field_type is bool:
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+            return value
+        if field_type is int:
+            try:
+                return int(value)
+            except ValueError:
+                return value
+        if field_type is float:
+            try:
+                return float(value)
+            except ValueError:
+                return value
+        return value
+
+
+class TemplateView(ContextMixin, TemplateResponseMixin, APIView):
+    """
+    Render a template with a context.
+
+    Example:
+        @api.view("/about")
+        class AboutView(TemplateView):
+            template_name = "about.html"
+
+            async def get(self, request):
+                return await super().get(request)
+    """
+
+    async def get(self, request: Request):
+        context = self.get_context_data()
+        return self.render_to_response(context)
+
+
+class ListView(ContextMixin, TemplateResponseMixin, ObjectLookupMixin, APIView):
+    """
+    Render a template with a list of objects.
+
+    The queryset is available in the template as ``object_list`` and under the
+    model's lowercased name (for example ``article``).
+
+    Example:
+        @api.view("/articles")
+        class ArticleListView(ListView):
+            queryset = Article.objects.all()
+            template_name = "article_list.html"
+            context_object_name = "articles"
+    """
+
+    context_object_name: str | None = None
+    paginate_by: int | None = None
+
+    async def get(self, request: Request):
+        queryset = await self.get_queryset()
+        self.object_list = [obj async for obj in queryset]
+        context = self.get_context_data(object_list=self.object_list)
+        return self.render_to_response(context)
+
+    def get_context_object_name(self, object_list: Any) -> str | None:
+        """
+        Return the context variable name for the object list.
+
+        Uses ``context_object_name`` when set, else the model's lowercased name.
+
+        Args:
+            object_list: The queryset of objects
+
+        Returns:
+            The context variable name, or None
+        """
+        if self.context_object_name:
+            return self.context_object_name
+        return super().get_context_object_name(object_list)
+
+    def get_context_data(self, **kwargs: Any) -> dict[str, Any]:
+        context = super().get_context_data(**kwargs)
+        object_list = context.get("object_list")
+        context_object_name = self.get_context_object_name(object_list)
+        if context_object_name and object_list is not None:
+            context[context_object_name] = object_list
+        return context
+
+
+class DetailView(ContextMixin, TemplateResponseMixin, ObjectLookupMixin, APIView):
+    """
+    Render a template with a single object.
+
+    The object is available in the template as ``object`` and under the model's
+    lowercased name (for example ``article``).
+
+    Example:
+        @api.view("/articles/{pk}")
+        class ArticleDetailView(DetailView):
+            queryset = Article.objects.all()
+            template_name = "article_detail.html"
+    """
+
+    context_object_name: str | None = None
+
+    async def get(self, request: Request):
+        self.object = await self.get_object()
+        context = self.get_context_data(object=self.object)
+        return self.render_to_response(context)
+
+    def get_context_data(self, **kwargs: Any) -> dict[str, Any]:
+        context = super().get_context_data(**kwargs)
+        obj = context.get("object")
+        if obj is not None:
+            context_object_name = self.get_context_object_name(obj)
+            if context_object_name:
+                context[context_object_name] = obj
+        return context
+
+
+class FormView(ContextMixin, TemplateResponseMixin, FormMixin, APIView):
+    """
+    Render a form and process its submission.
+
+    On success the view redirects to ``success_url``. On validation failure it
+    re-renders the template with ``form_errors`` and ``form_data`` in context.
+
+    Example:
+        @api.view("/contact", methods=["GET", "POST"])
+        class ContactView(FormView):
+            template_name = "contact.html"
+            form_serializer_class = ContactSerializer
+            success_url = "/contact/thanks"
+    """
+
+    async def get(self, request: Request):
+        context = self.get_context_data()
+        return self.render_to_response(context)
+
+    async def post(self, request: Request):
+        try:
+            validated = self.validate_form()
+        except RequestValidationError as e:
+            context = self.get_context_data(form_errors=e.errors(), form_data=self.get_form_data())
+            return self.render_to_response(context, status=422)
+        return self.form_valid(validated)
+
+    def form_valid(self, validated: Any) -> Redirect:
+        """Return a redirect response after a successful form submission."""
+        return self.redirect(self.get_success_url())
+
+
+class CreateView(ContextMixin, TemplateResponseMixin, ObjectLookupMixin, MutationMixin, FormMixin, APIView):
+    """
+    Render a form to create an object and process its submission.
+
+    On success the object is saved and the view redirects to ``success_url``.
+
+    Example:
+        @api.view("/articles/new", methods=["GET", "POST"])
+        class ArticleCreateView(CreateView):
+            queryset = Article.objects.all()
+            template_name = "article_form.html"
+            form_serializer_class = ArticleCreateSerializer
+            success_url = "/articles"
+    """
+
+    async def get(self, request: Request):
+        self.object = None
+        context = self.get_context_data(object=self.object)
+        return self.render_to_response(context)
+
+    async def post(self, request: Request):
+        self.object = None
+        try:
+            validated = self.validate_form()
+        except RequestValidationError as e:
+            context = self.get_context_data(object=self.object, form_errors=e.errors(), form_data=self.get_form_data())
+            return self.render_to_response(context, status=422)
+        return await self.form_valid(validated)
+
+    async def form_valid(self, validated: Any) -> Redirect:
+        """Create and save the object, then redirect to ``success_url``."""
+        base_queryset = self._get_base_queryset()
+        model = base_queryset.model if base_queryset is not None else (await self.get_queryset()).model
+        obj = validated.to_model(model)
+        await self.perform_create(obj)
+        self.object = obj
+        return self.redirect(self.get_success_url())
+
+
+class UpdateView(ContextMixin, TemplateResponseMixin, ObjectLookupMixin, MutationMixin, FormMixin, APIView):
+    """
+    Render a form to update an object and process its submission.
+
+    On success the object is saved and the view redirects to ``success_url``.
+
+    Example:
+        @api.view("/articles/{pk}/edit", methods=["GET", "POST"])
+        class ArticleUpdateView(UpdateView):
+            queryset = Article.objects.all()
+            template_name = "article_form.html"
+            form_serializer_class = ArticleUpdateSerializer
+            success_url = "/articles"
+    """
+
+    async def get(self, request: Request):
+        self.object = await self.get_object()
+        context = self.get_context_data(object=self.object)
+        return self.render_to_response(context)
+
+    async def post(self, request: Request):
+        self.object = await self.get_object()
+        try:
+            validated = self.validate_form()
+        except RequestValidationError as e:
+            context = self.get_context_data(object=self.object, form_errors=e.errors(), form_data=self.get_form_data())
+            return self.render_to_response(context, status=422)
+        return await self.form_valid(validated)
+
+    def get_form_serializer_class(self) -> type[Serializer]:
+        """Return the update serializer class for form validation."""
+        if self.form_serializer_class is not None:
+            return self.form_serializer_class
+        return self.get_serializer_class("update")
+
+    async def form_valid(self, validated: Any) -> Redirect:
+        """Update and save the object, then redirect to ``success_url``."""
+        obj = self.object
+        if validated.__struct_config__.omit_defaults:
+            for key, value in validated.to_dict().items():
+                setattr(obj, key, value)
+        else:
+            validated.update_instance(obj)
+        await self.perform_update(obj)
+        return self.redirect(self.get_success_url())
+
+
+class DeleteView(ContextMixin, TemplateResponseMixin, ObjectLookupMixin, MutationMixin, RedirectMixin, APIView):
+    """
+    Render a confirmation page and process deletion.
+
+    On POST the object is deleted and the view redirects to ``success_url``.
+
+    Example:
+        @api.view("/articles/{pk}/delete", methods=["GET", "POST"])
+        class ArticleDeleteView(DeleteView):
+            queryset = Article.objects.all()
+            template_name = "article_confirm_delete.html"
+            success_url = "/articles"
+    """
+
+    async def get(self, request: Request):
+        self.object = await self.get_object()
+        context = self.get_context_data(object=self.object)
+        return self.render_to_response(context)
+
+    async def post(self, request: Request):
+        self.object = await self.get_object()
+        await self._perform_destroy(self.object)
+        return self.redirect(self.get_success_url())

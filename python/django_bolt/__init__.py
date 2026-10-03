@@ -154,13 +154,20 @@ from .types import (
 from .views import (
     APIView,
     CreateMixin,
+    CreateView,
+    DeleteView,
     DestroyMixin,
+    DetailView,
+    FormView,
     ListMixin,
+    ListView,
     ModelViewSet,
     PartialUpdateMixin,
     ReadOnlyModelViewSet,
     RetrieveMixin,
+    TemplateView,
     UpdateMixin,
+    UpdateView,
     ViewSet,
 )
 
@@ -213,6 +220,14 @@ __all__ = [
     "UpdateMixin",
     "PartialUpdateMixin",
     "DestroyMixin",
+    # Template class-based views
+    "TemplateView",
+    "ListView",
+    "DetailView",
+    "FormView",
+    "CreateView",
+    "UpdateView",
+    "DeleteView",
     # Pagination
     "PaginationBase",
     "PageNumberPagination",
